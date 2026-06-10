@@ -1,0 +1,15 @@
+{
+  "name": "shopeepro-backend",
+  "version": "1.0.0",
+  "description": "Backend do ShopeePro — RSS Promobit/Pelando + conversor de links Shopee",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^2.7.0",
+    "xml2js": "^0.6.2"
+  }
+}
