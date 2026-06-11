@@ -90,41 +90,52 @@ app.post('/shopee/rss', async (req, res) => {
   try {
     const allItems = [];
 
-    // Busca Promobit RSS
-    if (sources.includes('promobit')) {
-      try {
-        const cacheKey = 'promobit';
-        const now = Date.now();
-        if (!cache[cacheKey] || (now - cache.lastFetch[cacheKey]) > CACHE_TTL) {
-          const items = await parseRSS('https://www.promobit.com.br/feed/');
-          cache[cacheKey] = items;
-          cache.lastFetch[cacheKey] = now;
-          console.log(`[Promobit] ${items.length} itens carregados`);
-        }
-        const normalized = cache[cacheKey].map(i => normalizeItem(i, 'promobit'));
-        allItems.push(...normalized);
-      } catch(e) {
-        console.warn('[Promobit RSS]', e.message);
-      }
-    }
+    // Lista de feeds RSS a tentar
+  const feedSources = [
+    { key: 'promobit', urls: [
+      'https://www.promobit.com.br/feed/',
+      'https://promobit.com.br/feed/',
+      'https://www.promobit.com.br/rss/',
+    ], enabled: sources.includes('promobit') },
+    { key: 'pelando', urls: [
+      'https://www.pelando.com.br/feed',
+      'https://pelando.com.br/feed',
+      'https://www.pelando.com.br/rss',
+    ], enabled: sources.includes('pelando') },
+  ];
 
-    // Busca Pelando RSS
-    if (sources.includes('pelando')) {
-      try {
-        const cacheKey = 'pelando';
-        const now = Date.now();
-        if (!cache[cacheKey] || (now - cache.lastFetch[cacheKey]) > CACHE_TTL) {
-          const items = await parseRSS('https://www.pelando.com.br/feed');
-          cache[cacheKey] = items;
-          cache.lastFetch[cacheKey] = now;
-          console.log(`[Pelando] ${items.length} itens carregados`);
+  for (const src of feedSources) {
+    if (!src.enabled) continue;
+    try {
+      const now = Date.now();
+      if (!cache[src.key] || (now - (cache.lastFetch[src.key]||0)) > CACHE_TTL) {
+        let items = null;
+        for (const url of src.urls) {
+          try {
+            items = await parseRSS(url);
+            if (items && items.length > 0) {
+              console.log(`[${src.key}] ${items.length} itens via ${url}`);
+              break;
+            }
+          } catch(e) {
+            console.warn(`[${src.key}] falhou ${url}: ${e.message}`);
+          }
         }
-        const normalized = cache[cacheKey].map(i => normalizeItem(i, 'pelando'));
-        allItems.push(...normalized);
-      } catch(e) {
-        console.warn('[Pelando RSS]', e.message);
+        if (items && items.length > 0) {
+          cache[src.key] = items;
+          cache.lastFetch[src.key] = now;
+        } else {
+          console.warn(`[${src.key}] todos os feeds falharam`);
+          cache[src.key] = cache[src.key] || [];
+        }
       }
+      const normalized = (cache[src.key]||[]).map(i => normalizeItem(i, src.key));
+      allItems.push(...normalized);
+      console.log(`[${src.key}] ${normalized.length} itens normalizados, ${normalized.filter(i=>i.isShopee).length} Shopee`);
+    } catch(e) {
+      console.warn(`[${src.key}]`, e.message);
     }
+  }
 
     // Filtra só Shopee
     let shopeeItems = allItems.filter(i => i.isShopee);
@@ -165,19 +176,23 @@ app.post('/offers/all', async (req, res) => {
   try {
     const allItems = [];
 
+    const feedUrls = {
+      promobit: ['https://www.promobit.com.br/feed/', 'https://promobit.com.br/feed/'],
+      pelando: ['https://www.pelando.com.br/feed', 'https://pelando.com.br/feed'],
+    };
+
     for (const source of sources) {
       try {
-        const feedUrl = source === 'promobit'
-          ? 'https://www.promobit.com.br/feed/'
-          : 'https://www.pelando.com.br/feed';
-
         const now = Date.now();
         if (!cache[source] || (now - (cache.lastFetch[source] || 0)) > CACHE_TTL) {
-          const items = await parseRSS(feedUrl);
-          cache[source] = items;
-          cache.lastFetch[source] = now;
+          let items = null;
+          for (const url of (feedUrls[source] || [])) {
+            try { items = await parseRSS(url); if (items?.length > 0) break; } catch(e) {}
+          }
+          if (items?.length > 0) { cache[source] = items; cache.lastFetch[source] = now; }
+          else { cache[source] = cache[source] || []; }
         }
-        allItems.push(...cache[source].map(i => normalizeItem(i, source)));
+        allItems.push(...(cache[source]||[]).map(i => normalizeItem(i, source)));
       } catch(e) {
         console.warn(`[${source}]`, e.message);
       }
@@ -282,10 +297,44 @@ app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
     cache: {
-      promobit: cache.promobit ? { items: cache.promobit.length, lastFetch: new Date(cache.lastFetch.promobit).toISOString() } : null,
-      pelando: cache.pelando ? { items: cache.pelando.length, lastFetch: new Date(cache.lastFetch.pelando).toISOString() } : null,
+      promobit: cache.promobit ? {
+        items: cache.promobit.length,
+        shopeeItems: cache.promobit.map(i => normalizeItem(i,'promobit')).filter(i=>i.isShopee).length,
+        lastFetch: cache.lastFetch.promobit ? new Date(cache.lastFetch.promobit).toISOString() : null,
+      } : null,
+      pelando: cache.pelando ? {
+        items: cache.pelando.length,
+        shopeeItems: cache.pelando.map(i => normalizeItem(i,'pelando')).filter(i=>i.isShopee).length,
+        lastFetch: cache.lastFetch.pelando ? new Date(cache.lastFetch.pelando).toISOString() : null,
+      } : null,
     },
   });
+});
+
+// Debug: ver itens crus do feed
+app.get('/debug/feed/:source', async (req, res) => {
+  const source = req.params.source;
+  const feedUrls = {
+    promobit: ['https://www.promobit.com.br/feed/', 'https://promobit.com.br/feed/'],
+    pelando: ['https://www.pelando.com.br/feed', 'https://pelando.com.br/feed'],
+  };
+  const urls = feedUrls[source];
+  if (!urls) return res.status(400).json({ error: 'fonte inválida' });
+
+  for (const url of urls) {
+    try {
+      const items = await parseRSS(url);
+      const normalized = items.map(i => normalizeItem(i, source));
+      return res.json({
+        url, total: items.length,
+        shopee: normalized.filter(i=>i.isShopee).length,
+        sample: normalized.slice(0,5).map(i => ({ title:i.title, isShopee:i.isShopee, link:i.link?.slice(0,80) })),
+      });
+    } catch(e) {
+      console.warn(e.message);
+    }
+  }
+  res.status(500).json({ error: 'todos os feeds falharam' });
 });
 
 app.listen(PORT, () => {
