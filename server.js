@@ -23,16 +23,72 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'ShopeePro Backend rodando!' });
 });
 
-// ── Parser de RSS ─────────────────────────────────────────────────
+// ── Parser de RSS com múltiplos proxies ──────────────────────────
 async function parseRSS(url) {
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ShopeePro/1.0)' },
-    timeout: 10000,
-  });
-  if (!res.ok) throw new Error(`RSS erro ${res.status}: ${url}`);
-  const xml = await res.text();
-  const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
-  return parsed?.rss?.channel?.item || parsed?.feed?.entry || [];
+  const proxies = [
+    // Direto
+    async () => {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Referer': 'https://www.google.com/',
+        },
+        timeout: 15000,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    },
+    // Via rss2json
+    async () => {
+      const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}&api_key=public&count=50`;
+      const res = await fetch(apiUrl, { timeout: 15000 });
+      if (!res.ok) throw new Error(`rss2json HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.status !== 'ok') throw new Error(`rss2json: ${data.message}`);
+      // Converte formato rss2json para XML-like objects
+      return JSON.stringify(data.items);
+    },
+    // Via allorigins
+    async () => {
+      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+      const res = await fetch(proxyUrl, { timeout: 15000 });
+      if (!res.ok) throw new Error(`allorigins HTTP ${res.status}`);
+      return await res.text();
+    },
+  ];
+
+  let lastError = null;
+  for (const proxy of proxies) {
+    try {
+      const content = await proxy();
+
+      // Se é JSON (rss2json format)
+      if (content.startsWith('[')) {
+        const items = JSON.parse(content);
+        return items.map(item => ({
+          title: item.title || '',
+          description: item.description || item.content || '',
+          link: item.link || '',
+          pubDate: item.pubDate || '',
+          enclosure: item.enclosure ? { url: item.thumbnail || '' } : null,
+        }));
+      }
+
+      // Se é XML
+      const parsed = await xml2js.parseStringPromise(content, { explicitArray: false });
+      const items = parsed?.rss?.channel?.item || parsed?.feed?.entry || [];
+      if (Array.isArray(items) && items.length > 0) return items;
+      if (items && !Array.isArray(items)) return [items];
+      throw new Error('Feed vazio');
+    } catch(e) {
+      lastError = e;
+      console.warn(`[RSS proxy] ${e.message}`);
+    }
+  }
+  throw new Error(`Todos os proxies falharam: ${lastError?.message}`);
 }
 
 // ── Normaliza item do RSS ─────────────────────────────────────────
