@@ -1,274 +1,242 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const xml2js = require('xml2js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
 app.use(express.json());
 
-// ── Cache simples em memória ──────────────────────────────────────
-const cache = { promobit: null, pelando: null, lastFetch: {} };
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutos
+// ── Cache ─────────────────────────────────────────────────────────
+const cache = {};
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
-// ── Rota de teste ─────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'ShopeePro Backend rodando!' });
-});
+// ── Canais do Telegram com ofertas da Shopee ──────────────────────
+const SHOPEE_CHANNELS = [
+  'shopeebrasil',
+  'ofertasshopee',
+  'cuponshopeebr',
+  'achados_shopee',
+  'shopeeofertas',
+  'promododobr',
+];
 
-// ── Parser de RSS com múltiplos proxies ──────────────────────────
-async function parseRSS(url) {
-  const proxies = [
-    // Direto
-    async () => {
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-          'Accept-Language': 'pt-BR,pt;q=0.9',
-          'Cache-Control': 'no-cache',
-          'Referer': 'https://www.google.com/',
-        },
-        timeout: 15000,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.text();
+// ── Lê mensagens de canal público do Telegram ─────────────────────
+async function readTelegramChannel(channel) {
+  const url = `https://t.me/s/${channel}`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
     },
-    // Via rss2json
-    async () => {
-      const apiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}&api_key=public&count=50`;
-      const res = await fetch(apiUrl, { timeout: 15000 });
-      if (!res.ok) throw new Error(`rss2json HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.status !== 'ok') throw new Error(`rss2json: ${data.message}`);
-      // Converte formato rss2json para XML-like objects
-      return JSON.stringify(data.items);
-    },
-    // Via allorigins
-    async () => {
-      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-      const res = await fetch(proxyUrl, { timeout: 15000 });
-      if (!res.ok) throw new Error(`allorigins HTTP ${res.status}`);
-      return await res.text();
-    },
-  ];
+    timeout: 15000,
+  });
 
-  let lastError = null;
-  for (const proxy of proxies) {
-    try {
-      const content = await proxy();
+  if (!res.ok) throw new Error(`Telegram ${channel}: HTTP ${res.status}`);
+  const html = await res.text();
 
-      // Se é JSON (rss2json format)
-      if (content.startsWith('[')) {
-        const items = JSON.parse(content);
-        return items.map(item => ({
-          title: item.title || '',
-          description: item.description || item.content || '',
-          link: item.link || '',
-          pubDate: item.pubDate || '',
-          enclosure: item.enclosure ? { url: item.thumbnail || '' } : null,
-        }));
-      }
+  // Extrai mensagens do HTML do Telegram
+  const messages = [];
+  const msgRegex = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g;
+  const linkRegex = /href="(https?:\/\/[^"]+)"/g;
+  const imgRegex = /<a[^>]+style="background-image:url\('([^']+)'\)"/g;
+  const dateRegex = /<time[^>]+datetime="([^"]+)"/g;
 
-      // Se é XML
-      const parsed = await xml2js.parseStringPromise(content, { explicitArray: false });
-      const items = parsed?.rss?.channel?.item || parsed?.feed?.entry || [];
-      if (Array.isArray(items) && items.length > 0) return items;
-      if (items && !Array.isArray(items)) return [items];
-      throw new Error('Feed vazio');
-    } catch(e) {
-      lastError = e;
-      console.warn(`[RSS proxy] ${e.message}`);
+  // Extrai blocos de mensagem
+  const blockRegex = /<div class="tgme_widget_message[^"]*"[^>]*data-post="([^"]+)"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g;
+  let blockMatch;
+
+  while ((blockMatch = blockRegex.exec(html)) !== null) {
+    const block = blockMatch[2];
+
+    // Texto da mensagem
+    const textMatch = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(block);
+    const rawText = textMatch ? textMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+
+    // Links na mensagem
+    const links = [];
+    let linkMatch;
+    const linkReg = /href="(https?:\/\/[^"]+)"/g;
+    while ((linkMatch = linkReg.exec(block)) !== null) {
+      links.push(linkMatch[1]);
+    }
+
+    // Data
+    const dateMatch = /<time[^>]+datetime="([^"]+)"/.exec(block);
+    const date = dateMatch ? dateMatch[1] : '';
+
+    // Imagem
+    const imgMatch = /style="background-image:url\('([^']+)'\)"/.exec(block);
+    const image = imgMatch ? imgMatch[1] : '';
+
+    if (rawText.length > 10) {
+      messages.push({ text: rawText, links, date, image, channel });
     }
   }
-  throw new Error(`Todos os proxies falharam: ${lastError?.message}`);
+
+  // Fallback: regex mais simples
+  if (messages.length === 0) {
+    const simpleRegex = /<div class="tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/g;
+    let m;
+    while ((m = simpleRegex.exec(html)) !== null) {
+      const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (text.length > 20) {
+        messages.push({ text, links: [], date: '', image: '', channel });
+      }
+    }
+  }
+
+  return messages;
 }
 
-// ── Normaliza item do RSS ─────────────────────────────────────────
-function normalizeItem(item, source) {
-  const title = item.title?._ || item.title || '';
-  const description = item.description?._ || item.description || item.summary?._ || item.summary || '';
-  const link = item.link?.href || item.link || item.guid?._ || item.guid || '';
-  const pubDate = item.pubDate || item.published || item.updated || '';
-  const image = extractImage(description) || item.enclosure?.url || '';
+// ── Normaliza mensagem do Telegram em oferta ──────────────────────
+function parseOffer(msg) {
+  const text = msg.text;
 
-  // Extrai preço da descrição
-  const priceMatch = (title + ' ' + description).match(/R\$\s*([\d.,]+)/);
-  const price = priceMatch ? parseFloat(priceMatch[1].replace('.','').replace(',','.')) : null;
+  // Extrai preço
+  const priceMatch = text.match(/R\$\s*([\d.,]+)/);
+  const price = priceMatch ? parseFloat(priceMatch[1].replace(/\./g,'').replace(',','.')) : null;
 
   // Extrai desconto
-  const discMatch = (title + ' ' + description).match(/(\d{1,3})\s*%\s*(?:off|de desconto|OFF)/i);
+  const discMatch = text.match(/(\d{1,3})\s*%\s*(?:off|de desconto|OFF|desconto)/i)
+    || text.match(/-(\d{1,3})%/);
   const discount = discMatch ? parseInt(discMatch[1]) : 0;
 
+  // Pega link da Shopee
+  const shopeeLink = msg.links.find(l =>
+    l.includes('shopee') || l.includes('shope.ee') || l.includes('s.shopee')
+  ) || msg.links[0] || '';
+
+  // Título: primeira linha não vazia
+  const title = text.split(/[\n.!]/)[0].trim().slice(0, 120);
+
   // Verifica se é Shopee
-  const isShopee = /shopee/i.test(title + description + link);
+  const isShopee = /shopee/i.test(text + shopeeLink);
 
-  return { title, description, link, pubDate, image, price, discount, isShopee, source };
+  return {
+    id: `${msg.channel}-${msg.date}-${Math.random().toString(36).slice(2,6)}`,
+    title,
+    description: text.slice(0, 300),
+    price,
+    discount,
+    link: shopeeLink,
+    affiliateLink: shopeeLink, // será substituído pelo link de afiliado
+    image: msg.image || '',
+    date: msg.date,
+    source: msg.channel,
+    isShopee,
+  };
 }
 
-function extractImage(html) {
-  const match = html.match(/<img[^>]+src=["']([^"']+)["']/i);
-  return match ? match[1] : null;
-}
-
-// ── Converte link para afiliado Shopee ───────────────────────────
-function convertToAffiliateLink(url, subId = '') {
+// ── Converte link para afiliado Shopee ────────────────────────────
+function toAffiliateLink(url, subId = '') {
   if (!url) return url;
-
-  // Se já é link de afiliado, retorna como está
-  if (url.includes('shope.ee') || url.includes('s.shopee')) return url;
-
-  // Shopee usa o formato: https://shope.ee/xxxxx
-  // Para converter, usamos a API da Shopee (quando disponível)
-  // Por enquanto, adiciona parâmetro de rastreamento
   try {
-    const parsed = new URL(url);
-    if (parsed.hostname.includes('shopee')) {
-      if (subId) parsed.searchParams.set('af_sub_siteid', subId);
-      parsed.searchParams.set('af_channel', 'ShopeePro');
-      return parsed.toString();
+    if (url.includes('shope.ee')) return url; // já é curto, precisa da API
+    const u = new URL(url);
+    if (u.hostname.includes('shopee')) {
+      if (subId) u.searchParams.set('af_sub_siteid', subId);
+      u.searchParams.set('af_channel', 'ShopeePro');
+      return u.toString();
     }
   } catch(e) {}
   return url;
 }
 
-// ── ROTA: Buscar ofertas Shopee via RSS ───────────────────────────
+// ── ROTA: status ──────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'ShopeePro Backend rodando!', version: '2.0' });
+});
+
+app.get('/status', (req, res) => {
+  const cacheInfo = {};
+  for (const [k, v] of Object.entries(cache)) {
+    cacheInfo[k] = { items: v.data?.length || 0, age: Math.round((Date.now() - v.ts) / 1000) + 's' };
+  }
+  res.json({ status: 'ok', cache: cacheInfo, channels: SHOPEE_CHANNELS });
+});
+
+// ── ROTA: buscar ofertas via Telegram ────────────────────────────
 app.post('/shopee/rss', async (req, res) => {
-  const { keyword = '', minDiscount = 0, sources = ['promobit', 'pelando'], subId = '' } = req.body;
+  const { keyword = '', minDiscount = 0, subId = '', channels } = req.body;
+  const targetChannels = channels || SHOPEE_CHANNELS;
 
   try {
-    const allItems = [];
+    let allOffers = [];
 
-    // Lista de feeds RSS a tentar
-  const feedSources = [
-    { key: 'promobit', urls: [
-      'https://www.promobit.com.br/feed/',
-      'https://promobit.com.br/feed/',
-      'https://www.promobit.com.br/rss/',
-    ], enabled: sources.includes('promobit') },
-    { key: 'pelando', urls: [
-      'https://www.pelando.com.br/feed',
-      'https://pelando.com.br/feed',
-      'https://www.pelando.com.br/rss',
-    ], enabled: sources.includes('pelando') },
-  ];
+    for (const channel of targetChannels) {
+      try {
+        const cacheKey = `tg_${channel}`;
+        const now = Date.now();
 
-  for (const src of feedSources) {
-    if (!src.enabled) continue;
-    try {
-      const now = Date.now();
-      if (!cache[src.key] || (now - (cache.lastFetch[src.key]||0)) > CACHE_TTL) {
-        let items = null;
-        for (const url of src.urls) {
-          try {
-            items = await parseRSS(url);
-            if (items && items.length > 0) {
-              console.log(`[${src.key}] ${items.length} itens via ${url}`);
-              break;
-            }
-          } catch(e) {
-            console.warn(`[${src.key}] falhou ${url}: ${e.message}`);
-          }
+        if (!cache[cacheKey] || (now - cache[cacheKey].ts) > CACHE_TTL) {
+          console.log(`[Telegram] Lendo @${channel}...`);
+          const messages = await readTelegramChannel(channel);
+          const offers = messages.map(parseOffer).filter(o => o.title.length > 5);
+          cache[cacheKey] = { data: offers, ts: now };
+          console.log(`[Telegram] @${channel}: ${offers.length} ofertas (${offers.filter(o=>o.isShopee).length} Shopee)`);
         }
-        if (items && items.length > 0) {
-          cache[src.key] = items;
-          cache.lastFetch[src.key] = now;
-        } else {
-          console.warn(`[${src.key}] todos os feeds falharam`);
-          cache[src.key] = cache[src.key] || [];
-        }
+
+        allOffers.push(...cache[cacheKey].data);
+      } catch(e) {
+        console.warn(`[Telegram @${channel}]`, e.message);
       }
-      const normalized = (cache[src.key]||[]).map(i => normalizeItem(i, src.key));
-      allItems.push(...normalized);
-      console.log(`[${src.key}] ${normalized.length} itens normalizados, ${normalized.filter(i=>i.isShopee).length} Shopee`);
-    } catch(e) {
-      console.warn(`[${src.key}]`, e.message);
     }
-  }
 
     // Filtra só Shopee
-    let shopeeItems = allItems.filter(i => i.isShopee);
+    let offers = allOffers.filter(o => o.isShopee);
 
-    // Filtra por keyword
+    // Filtro por keyword
     if (keyword) {
       const q = keyword.toLowerCase();
-      shopeeItems = shopeeItems.filter(i =>
-        i.title.toLowerCase().includes(q) ||
-        i.description.toLowerCase().includes(q)
+      offers = offers.filter(o =>
+        o.title.toLowerCase().includes(q) ||
+        o.description.toLowerCase().includes(q)
       );
     }
 
-    // Filtra por desconto mínimo
+    // Filtro por desconto
     if (minDiscount > 0) {
-      shopeeItems = shopeeItems.filter(i => i.discount >= minDiscount);
+      offers = offers.filter(o => o.discount >= minDiscount);
     }
 
     // Converte links para afiliado
-    shopeeItems = shopeeItems.map(i => ({
-      ...i,
-      affiliateLink: convertToAffiliateLink(i.link, subId),
-    }));
+    offers = offers.map(o => ({ ...o, affiliateLink: toAffiliateLink(o.link, subId) }));
 
     // Ordena por data mais recente
-    shopeeItems.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
+    offers.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    res.json({ offers: shopeeItems, total: shopeeItems.length });
+    res.json({ offers, total: offers.length });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── ROTA: Todas as ofertas (não só Shopee) ────────────────────────
+// ── ROTA: todas as ofertas (não só Shopee) ────────────────────────
 app.post('/offers/all', async (req, res) => {
-  const { keyword = '', minDiscount = 0, sources = ['promobit', 'pelando'], shopeeOnly = false } = req.body;
+  const { keyword = '', minDiscount = 0, shopeeOnly = false } = req.body;
 
   try {
-    const allItems = [];
-
-    const feedUrls = {
-      promobit: ['https://www.promobit.com.br/feed/', 'https://promobit.com.br/feed/'],
-      pelando: ['https://www.pelando.com.br/feed', 'https://pelando.com.br/feed'],
-    };
-
-    for (const source of sources) {
+    let allOffers = [];
+    for (const channel of SHOPEE_CHANNELS) {
       try {
+        const cacheKey = `tg_${channel}`;
         const now = Date.now();
-        if (!cache[source] || (now - (cache.lastFetch[source] || 0)) > CACHE_TTL) {
-          let items = null;
-          for (const url of (feedUrls[source] || [])) {
-            try { items = await parseRSS(url); if (items?.length > 0) break; } catch(e) {}
-          }
-          if (items?.length > 0) { cache[source] = items; cache.lastFetch[source] = now; }
-          else { cache[source] = cache[source] || []; }
+        if (!cache[cacheKey] || (now - cache[cacheKey].ts) > CACHE_TTL) {
+          const messages = await readTelegramChannel(channel);
+          cache[cacheKey] = { data: messages.map(parseOffer).filter(o => o.title.length > 5), ts: now };
         }
-        allItems.push(...(cache[source]||[]).map(i => normalizeItem(i, source)));
-      } catch(e) {
-        console.warn(`[${source}]`, e.message);
-      }
+        allOffers.push(...cache[cacheKey].data);
+      } catch(e) { console.warn(`@${channel}`, e.message); }
     }
 
-    let filtered = shopeeOnly ? allItems.filter(i => i.isShopee) : allItems;
-
-    if (keyword) {
-      const q = keyword.toLowerCase();
-      filtered = filtered.filter(i =>
-        i.title.toLowerCase().includes(q) ||
-        i.description.toLowerCase().includes(q)
-      );
-    }
-
-    if (minDiscount > 0) {
-      filtered = filtered.filter(i => i.discount >= minDiscount);
-    }
-
-    filtered.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
+    let filtered = shopeeOnly ? allOffers.filter(o => o.isShopee) : allOffers;
+    if (keyword) { const q = keyword.toLowerCase(); filtered = filtered.filter(o => o.title.toLowerCase().includes(q) || o.description.toLowerCase().includes(q)); }
+    if (minDiscount > 0) filtered = filtered.filter(o => o.discount >= minDiscount);
+    filtered.sort((a, b) => new Date(b.date) - new Date(a.date));
 
     res.json({ offers: filtered, total: filtered.length });
   } catch(err) {
@@ -276,123 +244,48 @@ app.post('/offers/all', async (req, res) => {
   }
 });
 
-// ── ROTA: Converter link para afiliado ────────────────────────────
+// ── ROTA: converter link ──────────────────────────────────────────
 app.post('/shopee/convert', async (req, res) => {
   const { url, subId = '', appId, secret } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL obrigatória' });
 
-  if (!url) return res.status(400).json({ error: 'URL é obrigatória' });
-
-  // Se tem credenciais da API Shopee, usa a API oficial
+  // Com API Shopee
   if (appId && secret) {
     try {
       const timestamp = Math.floor(Date.now() / 1000);
-      const payload = {
-        original_url: url,
-        sub_ids: subId ? [subId] : [],
-      };
-
-      const query = `
-        mutation generateAffiliateLink($input: GenerateAffiliateLinkInput!) {
-          generateAffiliateLink(input: $input) {
-            affiliate_link
-          }
-        }
-      `;
-
+      const query = `mutation generateAffiliateLink($input: GenerateAffiliateLinkInput!) { generateAffiliateLink(input: $input) { affiliate_link } }`;
       const response = await fetch('https://open-api.affiliate.shopee.com.br/graphql', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `SHA256 app_id=${appId},timestamp=${timestamp}`,
-        },
-        body: JSON.stringify({ query, variables: { input: payload } }),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `SHA256 app_id=${appId},timestamp=${timestamp}` },
+        body: JSON.stringify({ query, variables: { input: { original_url: url, sub_ids: subId ? [subId] : [] } } }),
       });
-
       if (response.ok) {
         const data = await response.json();
         const affiliateLink = data?.data?.generateAffiliateLink?.affiliate_link;
-        if (affiliateLink) {
-          return res.json({ affiliateLink, original: url, method: 'api' });
-        }
+        if (affiliateLink) return res.json({ affiliateLink, original: url, method: 'api' });
       }
-    } catch(e) {
-      console.warn('[Shopee API]', e.message);
-    }
+    } catch(e) { console.warn('[Shopee API]', e.message); }
   }
 
-  // Fallback: converte manualmente adicionando parâmetros
-  const affiliateLink = convertToAffiliateLink(url, subId);
-  res.json({ affiliateLink, original: url, method: 'manual' });
+  // Fallback manual
+  res.json({ affiliateLink: toAffiliateLink(url, subId), original: url, method: 'manual' });
 });
 
-// ── ROTA: Converter lote de links ─────────────────────────────────
-app.post('/shopee/convert-batch', async (req, res) => {
-  const { urls = [], subId = '', appId, secret } = req.body;
-  if (!urls.length) return res.status(400).json({ error: 'URLs são obrigatórias' });
-
-  const results = await Promise.all(
-    urls.map(async url => {
-      try {
-        const r = await fetch(`http://localhost:${PORT}/shopee/convert`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, subId, appId, secret }),
-        });
-        return await r.json();
-      } catch(e) {
-        return { original: url, affiliateLink: url, error: e.message };
-      }
-    })
-  );
-
-  res.json({ results });
-});
-
-// ── ROTA: Status dos feeds ────────────────────────────────────────
-app.get('/status', (req, res) => {
-  res.json({
-    status: 'ok',
-    cache: {
-      promobit: cache.promobit ? {
-        items: cache.promobit.length,
-        shopeeItems: cache.promobit.map(i => normalizeItem(i,'promobit')).filter(i=>i.isShopee).length,
-        lastFetch: cache.lastFetch.promobit ? new Date(cache.lastFetch.promobit).toISOString() : null,
-      } : null,
-      pelando: cache.pelando ? {
-        items: cache.pelando.length,
-        shopeeItems: cache.pelando.map(i => normalizeItem(i,'pelando')).filter(i=>i.isShopee).length,
-        lastFetch: cache.lastFetch.pelando ? new Date(cache.lastFetch.pelando).toISOString() : null,
-      } : null,
-    },
-  });
-});
-
-// Debug: ver itens crus do feed
-app.get('/debug/feed/:source', async (req, res) => {
-  const source = req.params.source;
-  const feedUrls = {
-    promobit: ['https://www.promobit.com.br/feed/', 'https://promobit.com.br/feed/'],
-    pelando: ['https://www.pelando.com.br/feed', 'https://pelando.com.br/feed'],
-  };
-  const urls = feedUrls[source];
-  if (!urls) return res.status(400).json({ error: 'fonte inválida' });
-
-  for (const url of urls) {
-    try {
-      const items = await parseRSS(url);
-      const normalized = items.map(i => normalizeItem(i, source));
-      return res.json({
-        url, total: items.length,
-        shopee: normalized.filter(i=>i.isShopee).length,
-        sample: normalized.slice(0,5).map(i => ({ title:i.title, isShopee:i.isShopee, link:i.link?.slice(0,80) })),
-      });
-    } catch(e) {
-      console.warn(e.message);
-    }
+// ── ROTA: debug canal ─────────────────────────────────────────────
+app.get('/debug/:channel', async (req, res) => {
+  const channel = req.params.channel;
+  try {
+    const messages = await readTelegramChannel(channel);
+    const offers = messages.map(parseOffer);
+    res.json({
+      channel, total: messages.length, shopee: offers.filter(o=>o.isShopee).length,
+      sample: offers.slice(0,5).map(o => ({ title: o.title, isShopee: o.isShopee, discount: o.discount, link: o.link?.slice(0,80) })),
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
-  res.status(500).json({ error: 'todos os feeds falharam' });
 });
 
 app.listen(PORT, () => {
-  console.log(`ShopeePro Backend rodando na porta ${PORT}`);
+  console.log(`ShopeePro Backend v2 rodando na porta ${PORT}`);
 });
