@@ -15,29 +15,41 @@ const SHOPEE_API = 'https://open-api.affiliate.shopee.com.br/graphql';
 
 function buildShopeeHeaders(appId, secret) {
   const timestamp = Math.floor(Date.now() / 1000);
+  // Formato correto: appid (minúsculo) + timestamp, sem espaço
   const payload = `${appId}${timestamp}`;
   const sign = crypto.createHmac('sha256', secret).update(payload).digest('hex');
   return {
     'Content-Type': 'application/json',
-    'Authorization': `SHA256 app_id=${appId},timestamp=${timestamp},sign=${sign}`,
+    // Formato exato exigido pela Shopee Afiliados BR
+    'Authorization': `SHA256 appid=${appId},timestamp=${timestamp},sign=${sign}`,
   };
 }
 
 async function shopeeQuery(appId, secret, query, variables = {}) {
+  const headers = buildShopeeHeaders(appId, secret);
+  console.log('[Shopee] Authorization:', headers.Authorization);
+
   const res = await fetch(SHOPEE_API, {
     method: 'POST',
-    headers: buildShopeeHeaders(appId, secret),
+    headers,
     body: JSON.stringify({ query, variables }),
   });
-  if (!res.ok) throw new Error(`Shopee API erro ${res.status}`);
-  const data = await res.json();
+
+  const text = await res.text();
+  console.log('[Shopee] Status:', res.status, 'Body:', text.slice(0, 300));
+
+  if (!res.ok) throw new Error(`Shopee API erro ${res.status}: ${text}`);
+
+  let data;
+  try { data = JSON.parse(text); } catch(e) { throw new Error('Resposta inválida da Shopee: ' + text.slice(0, 200)); }
+
   if (data.errors) throw new Error(data.errors[0]?.message || 'Shopee API error');
   return data.data;
 }
 
 // ── Rota de teste ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'ShopeePro Backend v3 rodando!', version: '3.0' });
+  res.json({ status: 'ok', message: 'ShopeePro Backend v3 rodando!', version: '3.1' });
 });
 
 // ── ROTA: Buscar produtos ─────────────────────────────────────────
@@ -77,7 +89,7 @@ app.post('/shopee/search', async (req, res) => {
         page: 1,
         limit: 30,
         keyword: keyword || undefined,
-        sortType: minComm > 0 ? 2 : 1, // 1=relevance, 2=commission
+        sortType: minComm > 0 ? 2 : 1,
         subId: subId || undefined,
         extraCommissionOnly: extraOnly || undefined,
       },
@@ -118,6 +130,7 @@ app.post('/shopee/search', async (req, res) => {
 
     res.json({ products, total: products.length });
   } catch(err) {
+    console.error('[/shopee/search]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -155,7 +168,7 @@ app.post('/shopee/flash', async (req, res) => {
       input: {
         page: 1,
         limit: 20,
-        sortType: 2, // maior comissão
+        sortType: 2,
         subId: subId || undefined,
       },
     };
@@ -190,6 +203,7 @@ app.post('/shopee/flash', async (req, res) => {
 
     res.json({ products, total: products.length });
   } catch(err) {
+    console.error('[/shopee/flash]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -217,7 +231,6 @@ app.post('/shopee/convert', async (req, res) => {
     }
   }
 
-  // Fallback manual
   try {
     const u = new URL(url);
     if (subId) u.searchParams.set('af_sub_siteid', subId);
@@ -228,6 +241,20 @@ app.post('/shopee/convert', async (req, res) => {
   }
 });
 
+// ── ROTA: Diagnóstico de credenciais ─────────────────────────────
+app.post('/shopee/ping', async (req, res) => {
+  const { appId, secret } = req.body;
+  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
+
+  try {
+    const query = `query { getOfferList(input: { page: 1, limit: 1 }) { nodes { itemId name } } }`;
+    const data = await shopeeQuery(appId, secret, query, {});
+    res.json({ ok: true, message: 'Credenciais válidas!', sample: data?.getOfferList?.nodes?.[0]?.name });
+  } catch(err) {
+    res.status(401).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`ShopeePro Backend v3 rodando na porta ${PORT}`);
+  console.log(`ShopeePro Backend v3.1 rodando na porta ${PORT}`);
 });
