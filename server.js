@@ -68,12 +68,11 @@ app.post('/shopee/search', async (req, res) => {
     const items = data?.productOfferV2?.nodes || [];
 
     const products = items
-      .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
       .map(p => {
-        const price = parseFloat(p.priceMin || 0);
+        const price = parseFloat(p.priceMin || p.priceMax || 0);
         const commRate = Math.round(parseFloat(p.commissionRate || 0) * 100 * 10) / 10;
         const sellerComm = Math.round(parseFloat(p.sellerCommissionRate || 0) * 100 * 10) / 10;
-        const discount = p.priceDiscountRate || 0;
+        const discount = parseInt(p.priceDiscountRate || 0);
         return {
           id: `${p.shopId}-${p.itemId}`,
           title: p.productName, price,
@@ -84,7 +83,8 @@ app.post('/shopee/search', async (req, res) => {
           totalComm: Math.round((commRate + sellerComm) * 10) / 10,
           link: p.productLink, affiliateLink: p.offerLink || p.productLink,
         };
-      });
+      })
+      .filter(p => p.totalComm >= minComm);
 
     res.json({ products, total: products.length });
   } catch(err) {
@@ -104,12 +104,11 @@ app.post('/shopee/flash', async (req, res) => {
     const items = data?.productOfferV2?.nodes || [];
 
     const products = items
-      .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
       .map(p => {
-        const price = parseFloat(p.priceMin || 0);
+        const price = parseFloat(p.priceMin || p.priceMax || 0);
         const commRate = Math.round(parseFloat(p.commissionRate || 0) * 100 * 10) / 10;
         const sellerComm = Math.round(parseFloat(p.sellerCommissionRate || 0) * 100 * 10) / 10;
-        const discount = p.priceDiscountRate || 0;
+        const discount = parseInt(p.priceDiscountRate || 0);
         return {
           id: `${p.shopId}-${p.itemId}`,
           title: p.productName, price, discount,
