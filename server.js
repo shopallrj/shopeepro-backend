@@ -61,28 +61,11 @@ app.post('/shopee/search', async (req, res) => {
   const { appId, secret, keyword = '', minComm = 0, extraOnly = false, subId = '' } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
   try {
-    const query = `
-      query getOfferList($input: OfferListInput!) {
-        getOfferList(input: $input) {
-          nodes {
-            itemId shopId name image price priceMin priceBefore
-            ratingStar sales commissionRate sellerCommissionRate
-            shopName url affiliateUrl
-          }
-          pageInfo { hasNextPage }
-        }
-      }
-    `;
-    const variables = {
-      input: {
-        page: 1, limit: 30,
-        keyword: keyword || undefined,
-        sortType: 2,
-        subId: subId || undefined,
-        extraCommissionOnly: extraOnly || undefined,
-      },
-    };
-    const data = await shopeeQuery(appId, secret, query, variables);
+    const kw = keyword ? `, keyword: "${keyword.replace(/"/g,'')}"` : '';
+    const si = subId ? `, subId: "${subId}"` : '';
+    const ex = extraOnly ? `, extraCommissionOnly: true` : '';
+    const query = `query { getOfferList(input: {page:1, limit:30, sortType:2${kw}${si}${ex}}) { nodes { itemId shopId name image price priceMin priceBefore ratingStar sales commissionRate sellerCommissionRate shopName url affiliateUrl } pageInfo { hasNextPage } } }`;
+    const data = await shopeeQuery(appId, secret, query, {});
     const items = data?.getOfferList?.nodes || [];
 
     const products = items
@@ -116,19 +99,9 @@ app.post('/shopee/flash', async (req, res) => {
   const { appId, secret, minComm = 0, subId = '' } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
   try {
-    const query = `
-      query getOfferList($input: OfferListInput!) {
-        getOfferList(input: $input) {
-          nodes {
-            itemId shopId name image price priceMin priceBefore
-            commissionRate sellerCommissionRate shopName url affiliateUrl priceDiscountRate
-          }
-          pageInfo { hasNextPage }
-        }
-      }
-    `;
-    const variables = { input: { page: 1, limit: 20, sortType: 2, subId: subId || undefined } };
-    const data = await shopeeQuery(appId, secret, query, variables);
+    const si2 = subId ? `, subId: "${subId}"` : '';
+    const flashQuery = `query { getOfferList(input: {page:1, limit:20, sortType:2${si2}}) { nodes { itemId shopId name image price priceMin priceBefore commissionRate sellerCommissionRate shopName url affiliateUrl priceDiscountRate } pageInfo { hasNextPage } } }`;
+    const data = await shopeeQuery(appId, secret, flashQuery, {});
     const items = data?.getOfferList?.nodes || [];
 
     const products = items
