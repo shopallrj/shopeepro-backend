@@ -12,6 +12,7 @@ app.use(express.json());
 
 const SHOPEE_API = 'https://open-api.affiliate.shopee.com.br/graphql';
 
+// Formato oficial da Shopee Affiliate API
 function buildShopeeHeaders(appId, secret) {
   const timestamp = Math.floor(Date.now() / 1000);
   const payload = `${appId}${timestamp}`;
@@ -24,68 +25,130 @@ function buildShopeeHeaders(appId, secret) {
 
 async function shopeeQuery(appId, secret, query, variables = {}) {
   const headers = buildShopeeHeaders(appId, secret);
-  console.log('[Shopee] Authorization:', headers.Authorization);
+  console.log('[Shopee] Auth:', headers.Authorization.slice(0, 60) + '...');
+
   const res = await fetch(SHOPEE_API, {
     method: 'POST',
     headers,
     body: JSON.stringify({ query, variables }),
   });
+
   const text = await res.text();
-  console.log('[Shopee] Status:', res.status, 'Body:', text.slice(0, 300));
-  if (!res.ok) throw new Error(`Shopee API erro ${res.status}: ${text}`);
+  console.log('[Shopee] Status:', res.status, '| Body:', text.slice(0, 400));
+
+  if (!res.ok) throw new Error(`Shopee HTTP ${res.status}: ${text.slice(0, 200)}`);
+
   let data;
-  try { data = JSON.parse(text); } catch(e) { throw new Error('Resposta inválida: ' + text.slice(0, 200)); }
-  if (data.errors) throw new Error(data.errors[0]?.message || 'Shopee API error');
+  try { data = JSON.parse(text); } catch(e) {
+    throw new Error('Resposta inválida da Shopee: ' + text.slice(0, 200));
+  }
+
+  if (data.errors) throw new Error(data.errors[0]?.message || JSON.stringify(data.errors[0]));
   return data.data;
 }
 
+// ── Rota de saúde ────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'ShopeePro Backend v3 rodando!', version: '3.2' });
+  res.json({ status: 'ok', message: 'ShopeePro Backend rodando!', version: '4.0' });
 });
 
-app.post('/shopee/search', async (req, res) => {
-  const { appId, secret, subId = '', keyword = '', category, minComm = 0, extraOnly = false } = req.body;
-  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
+// ── ROTA: Ping / diagnóstico ──────────────────────────────────────
+app.post('/shopee/ping', async (req, res) => {
+  const { appId, secret } = req.body;
+  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
+
   try {
     const query = `
-      query getOfferList($input: OfferListInput!) {
-        getOfferList(input: $input) {
+      query {
+        productOfferV2(input: { page: 1, limit: 1 }) {
+          nodes { itemId productName }
+        }
+      }
+    `;
+    const data = await shopeeQuery(appId, secret, query, {});
+    const sample = data?.productOfferV2?.nodes?.[0]?.productName || '(sem produto)';
+    res.json({ ok: true, message: 'Credenciais válidas!', sample });
+  } catch(err) {
+    res.status(401).json({ ok: false, error: err.message });
+  }
+});
+
+// ── ROTA: Buscar produtos ─────────────────────────────────────────
+app.post('/shopee/search', async (req, res) => {
+  const { appId, secret, subId = '', keyword = '', minComm = 0, extraOnly = false } = req.body;
+  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
+
+  try {
+    const query = `
+      query productOfferV2($input: ProductOfferV2Input!) {
+        productOfferV2(input: $input) {
           nodes {
-            itemId shopId name image price priceMin priceMax priceBefore
-            ratingStar sales commissionRate sellerCommissionRate
-            shopName shopType url affiliateUrl
+            itemId
+            shopId
+            productName
+            imageUrl
+            priceMin
+            priceMax
+            commissionRate
+            sellerCommissionRate
+            shopeeCommissionRate
+            sales
+            ratingStar
+            priceDiscountRate
+            shopName
+            shopType
+            productLink
+            offerLink
+            periodStartTime
+            periodEndTime
           }
           pageInfo { hasNextPage }
         }
       }
     `;
+
     const variables = {
       input: {
-        page: 1, limit: 30,
+        page: 1,
+        limit: 30,
         keyword: keyword || undefined,
-        sortType: minComm > 0 ? 2 : 1,
-        subId: subId || undefined,
-        extraCommissionOnly: extraOnly || undefined,
+        sortType: 5, // 5 = maior comissão
+        isAMSOffer: extraOnly ? true : undefined,
       },
     };
+
     const data = await shopeeQuery(appId, secret, query, variables);
-    const items = data?.getOfferList?.nodes || [];
+    const items = data?.productOfferV2?.nodes || [];
+
     const products = items
-      .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
+      .filter(p => {
+        const comm = parseFloat(p.commissionRate || 0) * 100 + parseFloat(p.sellerCommissionRate || 0) * 100;
+        return comm >= minComm;
+      })
       .map(p => {
-        const price = p.price || p.priceMin || 0;
-        const originalPrice = p.priceBefore || null;
-        const discount = originalPrice && price ? Math.round((1 - price / originalPrice) * 100) : 0;
+        const price = parseFloat(p.priceMin || 0);
+        const commRate = Math.round(parseFloat(p.commissionRate || 0) * 100 * 10) / 10;
+        const sellerComm = Math.round(parseFloat(p.sellerCommissionRate || 0) * 100 * 10) / 10;
+        const discount = p.priceDiscountRate || 0;
+
         return {
           id: `${p.shopId}-${p.itemId}`,
-          title: p.name, price, originalPrice, discount,
-          image: p.image, shop: p.shopName, rating: p.ratingStar, sales: p.sales,
-          commissionRate: p.commissionRate || 0,
-          sellerComm: p.sellerCommissionRate || 0,
-          totalComm: (p.commissionRate || 0) + (p.sellerCommissionRate || 0),
-          link: p.url, affiliateLink: p.affiliateUrl || p.url,
+          title: p.productName,
+          price,
+          originalPrice: discount > 0 ? Math.round(price / (1 - discount / 100)) : null,
+          discount,
+          image: p.imageUrl,
+          shop: p.shopName,
+          rating: parseFloat(p.ratingStar || 0),
+          sales: p.sales || 0,
+          commissionRate: commRate,
+          sellerComm,
+          totalComm: Math.round((commRate + sellerComm) * 10) / 10,
+          link: p.productLink,
+          affiliateLink: p.offerLink || p.productLink,
         };
       });
+
     res.json({ products, total: products.length });
   } catch(err) {
     console.error('[/shopee/search]', err.message);
@@ -93,41 +156,73 @@ app.post('/shopee/search', async (req, res) => {
   }
 });
 
+// ── ROTA: Relâmpago ───────────────────────────────────────────────
 app.post('/shopee/flash', async (req, res) => {
   const { appId, secret, subId = '', minComm = 0 } = req.body;
-  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
+  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
+
   try {
     const query = `
-      query getOfferList($input: OfferListInput!) {
-        getOfferList(input: $input) {
+      query productOfferV2($input: ProductOfferV2Input!) {
+        productOfferV2(input: $input) {
           nodes {
-            itemId shopId name image price priceMin priceBefore
-            commissionRate sellerCommissionRate shopName url affiliateUrl priceDiscountRate
+            itemId
+            shopId
+            productName
+            imageUrl
+            priceMin
+            commissionRate
+            sellerCommissionRate
+            shopName
+            productLink
+            offerLink
+            priceDiscountRate
+            periodEndTime
           }
           pageInfo { hasNextPage }
         }
       }
     `;
-    const variables = { input: { page: 1, limit: 20, sortType: 2, subId: subId || undefined } };
+
+    const variables = {
+      input: {
+        page: 1,
+        limit: 20,
+        sortType: 5,
+      },
+    };
+
     const data = await shopeeQuery(appId, secret, query, variables);
-    const items = data?.getOfferList?.nodes || [];
+    const items = data?.productOfferV2?.nodes || [];
+
     const products = items
-      .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
+      .filter(p => {
+        const comm = parseFloat(p.commissionRate || 0) * 100 + parseFloat(p.sellerCommissionRate || 0) * 100;
+        return comm >= minComm;
+      })
       .map(p => {
-        const price = p.price || p.priceMin || 0;
-        const originalPrice = p.priceBefore || null;
-        const discount = p.priceDiscountRate
-          ? Math.round(p.priceDiscountRate * 100)
-          : (originalPrice && price ? Math.round((1 - price / originalPrice) * 100) : 0);
+        const price = parseFloat(p.priceMin || 0);
+        const commRate = Math.round(parseFloat(p.commissionRate || 0) * 100 * 10) / 10;
+        const sellerComm = Math.round(parseFloat(p.sellerCommissionRate || 0) * 100 * 10) / 10;
+        const discount = p.priceDiscountRate || 0;
+
         return {
           id: `${p.shopId}-${p.itemId}`,
-          title: p.name, price, originalPrice, discount,
-          image: p.image, shop: p.shopName,
-          commissionRate: p.commissionRate || 0,
-          sellerComm: p.sellerCommissionRate || 0,
-          link: p.url, affiliateLink: p.affiliateUrl || p.url, isFlash: true,
+          title: p.productName,
+          price,
+          discount,
+          image: p.imageUrl,
+          shop: p.shopName,
+          commissionRate: commRate,
+          sellerComm,
+          totalComm: Math.round((commRate + sellerComm) * 10) / 10,
+          link: p.productLink,
+          affiliateLink: p.offerLink || p.productLink,
+          isFlash: true,
+          endTime: p.periodEndTime,
         };
       });
+
     res.json({ products, total: products.length });
   } catch(err) {
     console.error('[/shopee/flash]', err.message);
@@ -135,22 +230,28 @@ app.post('/shopee/flash', async (req, res) => {
   }
 });
 
+// ── ROTA: Converter link ──────────────────────────────────────────
 app.post('/shopee/convert', async (req, res) => {
   const { url, subId = '', appId, secret } = req.body;
   if (!url) return res.status(400).json({ error: 'URL obrigatória' });
+
   if (appId && secret) {
     try {
       const query = `
-        mutation generateAffiliateLink($input: GenerateAffiliateLinkInput!) {
-          generateAffiliateLink(input: $input) { affiliate_link }
+        mutation generateShortLink($input: GenerateShortLinkInput!) {
+          generateShortLink(input: $input) { shortLink }
         }
       `;
-      const variables = { input: { original_url: url, sub_ids: subId ? [subId] : [] } };
+      const variables = { input: { originUrl: url, subIds: subId ? [subId] : [] } };
       const data = await shopeeQuery(appId, secret, query, variables);
-      const affiliateLink = data?.generateAffiliateLink?.affiliate_link;
-      if (affiliateLink) return res.json({ affiliateLink, original: url, method: 'api' });
-    } catch(e) { console.warn('[convert]', e.message); }
+      const shortLink = data?.generateShortLink?.shortLink;
+      if (shortLink) return res.json({ affiliateLink: shortLink, original: url, method: 'api' });
+    } catch(e) {
+      console.warn('[convert API]', e.message);
+    }
   }
+
+  // Fallback manual
   try {
     const u = new URL(url);
     if (subId) u.searchParams.set('af_sub_siteid', subId);
@@ -161,18 +262,6 @@ app.post('/shopee/convert', async (req, res) => {
   }
 });
 
-app.post('/shopee/ping', async (req, res) => {
-  const { appId, secret } = req.body;
-  if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
-  try {
-    const query = `query { getOfferList(input: { page: 1, limit: 1 }) { nodes { itemId name } } }`;
-    const data = await shopeeQuery(appId, secret, query, {});
-    res.json({ ok: true, message: 'Credenciais válidas!', sample: data?.getOfferList?.nodes?.[0]?.name });
-  } catch(err) {
-    res.status(401).json({ ok: false, error: err.message });
-  }
-});
-
 app.listen(PORT, () => {
-  console.log(`ShopeePro Backend v3.2 rodando na porta ${PORT}`);
+  console.log(`ShopeePro Backend v4.0 rodando na porta ${PORT}`);
 });
