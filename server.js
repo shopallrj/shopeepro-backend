@@ -55,15 +55,23 @@ app.post('/shopee/ping', async (req, res) => {
   const { appId, secret } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret obrigatórios' });
   try {
-    const query = `
-      query productOfferV2($input: ProductOfferV2Input!) {
-        productOfferV2(input: $input) {
-          nodes { itemId productName }
-        }
-      }
-    `;
-    const data = await shopeeQuery(appId, secret, query, { input: { page: 1, limit: 1 } });
-    const sample = data?.productOfferV2?.nodes?.[0]?.productName || '(sem produto)';
+    // Testa qual query funciona
+    let sample = null;
+    const queries = [
+      { q: `query { getOfferList(input:{page:1,limit:1}) { nodes { itemId name } } }`, path: 'getOfferList', field: 'name' },
+      { q: `query { productOfferV2(page:1,limit:1) { nodes { itemId productName } } }`, path: 'productOfferV2', field: 'productName' },
+      { q: `query { offerList(page:1,limit:1) { nodes { itemId productName } } }`, path: 'offerList', field: 'productName' },
+    ];
+    let lastErr = '';
+    for (const q of queries) {
+      try {
+        const d = await shopeeQuery(appId, secret, q.q, {});
+        const nodes = d?.[q.path]?.nodes || [];
+        sample = nodes[0]?.[q.field] || '(sem produto)';
+        if (sample) break;
+      } catch(e) { lastErr = e.message; }
+    }
+    if (!sample) throw new Error(lastErr);
     res.json({ ok: true, message: 'Credenciais válidas!', sample });
   } catch(err) {
     res.status(401).json({ ok: false, error: err.message });
