@@ -10,124 +10,82 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders:
 app.options('*', cors());
 app.use(express.json());
 
-// ── Shopee API GraphQL ────────────────────────────────────────────
 const SHOPEE_API = 'https://open-api.affiliate.shopee.com.br/graphql';
 
 function buildShopeeHeaders(appId, secret) {
   const timestamp = Math.floor(Date.now() / 1000);
-  // Formato correto: appid (minúsculo) + timestamp, sem espaço
   const payload = `${appId}${timestamp}`;
   const sign = crypto.createHmac('sha256', secret).update(payload).digest('hex');
   return {
     'Content-Type': 'application/json',
-    // Formato exato exigido pela Shopee Afiliados BR
-    'Authorization': `SHA256 appid=${appId},timestamp=${timestamp},sign=${sign}`,
+    'Authorization': `SHA256 Credential=${appId}, Timestamp=${timestamp}, Signature=${sign}`,
   };
 }
 
 async function shopeeQuery(appId, secret, query, variables = {}) {
   const headers = buildShopeeHeaders(appId, secret);
   console.log('[Shopee] Authorization:', headers.Authorization);
-
   const res = await fetch(SHOPEE_API, {
     method: 'POST',
     headers,
     body: JSON.stringify({ query, variables }),
   });
-
   const text = await res.text();
   console.log('[Shopee] Status:', res.status, 'Body:', text.slice(0, 300));
-
   if (!res.ok) throw new Error(`Shopee API erro ${res.status}: ${text}`);
-
   let data;
-  try { data = JSON.parse(text); } catch(e) { throw new Error('Resposta inválida da Shopee: ' + text.slice(0, 200)); }
-
+  try { data = JSON.parse(text); } catch(e) { throw new Error('Resposta inválida: ' + text.slice(0, 200)); }
   if (data.errors) throw new Error(data.errors[0]?.message || 'Shopee API error');
   return data.data;
 }
 
-// ── Rota de teste ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'ShopeePro Backend v3 rodando!', version: '3.1' });
+  res.json({ status: 'ok', message: 'ShopeePro Backend v3 rodando!', version: '3.2' });
 });
 
-// ── ROTA: Buscar produtos ─────────────────────────────────────────
 app.post('/shopee/search', async (req, res) => {
   const { appId, secret, subId = '', keyword = '', category, minComm = 0, extraOnly = false } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
-
   try {
     const query = `
       query getOfferList($input: OfferListInput!) {
         getOfferList(input: $input) {
           nodes {
-            itemId
-            shopId
-            name
-            image
-            price
-            priceMin
-            priceMax
-            priceBefore
-            ratingStar
-            sales
-            commissionRate
-            sellerCommissionRate
-            shopName
-            shopType
-            url
-            affiliateUrl
+            itemId shopId name image price priceMin priceMax priceBefore
+            ratingStar sales commissionRate sellerCommissionRate
+            shopName shopType url affiliateUrl
           }
           pageInfo { hasNextPage }
         }
       }
     `;
-
     const variables = {
       input: {
-        page: 1,
-        limit: 30,
+        page: 1, limit: 30,
         keyword: keyword || undefined,
         sortType: minComm > 0 ? 2 : 1,
         subId: subId || undefined,
         extraCommissionOnly: extraOnly || undefined,
       },
     };
-
     const data = await shopeeQuery(appId, secret, query, variables);
     const items = data?.getOfferList?.nodes || [];
-
     const products = items
-      .filter(p => {
-        const comm = (p.commissionRate || 0) + (p.sellerCommissionRate || 0);
-        return comm >= minComm;
-      })
+      .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
       .map(p => {
         const price = p.price || p.priceMin || 0;
         const originalPrice = p.priceBefore || null;
         const discount = originalPrice && price ? Math.round((1 - price / originalPrice) * 100) : 0;
-        const commRate = (p.commissionRate || 0);
-        const sellerComm = (p.sellerCommissionRate || 0);
-
         return {
           id: `${p.shopId}-${p.itemId}`,
-          title: p.name,
-          price,
-          originalPrice,
-          discount,
-          image: p.image,
-          shop: p.shopName,
-          rating: p.ratingStar,
-          sales: p.sales,
-          commissionRate: commRate,
-          sellerComm,
-          totalComm: commRate + sellerComm,
-          link: p.url,
-          affiliateLink: p.affiliateUrl || p.url,
+          title: p.name, price, originalPrice, discount,
+          image: p.image, shop: p.shopName, rating: p.ratingStar, sales: p.sales,
+          commissionRate: p.commissionRate || 0,
+          sellerComm: p.sellerCommissionRate || 0,
+          totalComm: (p.commissionRate || 0) + (p.sellerCommissionRate || 0),
+          link: p.url, affiliateLink: p.affiliateUrl || p.url,
         };
       });
-
     res.json({ products, total: products.length });
   } catch(err) {
     console.error('[/shopee/search]', err.message);
@@ -135,47 +93,24 @@ app.post('/shopee/search', async (req, res) => {
   }
 });
 
-// ── ROTA: Promoções relâmpago ─────────────────────────────────────
 app.post('/shopee/flash', async (req, res) => {
   const { appId, secret, subId = '', minComm = 0 } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
-
   try {
     const query = `
       query getOfferList($input: OfferListInput!) {
         getOfferList(input: $input) {
           nodes {
-            itemId
-            shopId
-            name
-            image
-            price
-            priceMin
-            priceBefore
-            commissionRate
-            sellerCommissionRate
-            shopName
-            url
-            affiliateUrl
-            priceDiscountRate
+            itemId shopId name image price priceMin priceBefore
+            commissionRate sellerCommissionRate shopName url affiliateUrl priceDiscountRate
           }
           pageInfo { hasNextPage }
         }
       }
     `;
-
-    const variables = {
-      input: {
-        page: 1,
-        limit: 20,
-        sortType: 2,
-        subId: subId || undefined,
-      },
-    };
-
+    const variables = { input: { page: 1, limit: 20, sortType: 2, subId: subId || undefined } };
     const data = await shopeeQuery(appId, secret, query, variables);
     const items = data?.getOfferList?.nodes || [];
-
     const products = items
       .filter(p => (p.commissionRate || 0) + (p.sellerCommissionRate || 0) >= minComm)
       .map(p => {
@@ -184,23 +119,15 @@ app.post('/shopee/flash', async (req, res) => {
         const discount = p.priceDiscountRate
           ? Math.round(p.priceDiscountRate * 100)
           : (originalPrice && price ? Math.round((1 - price / originalPrice) * 100) : 0);
-
         return {
           id: `${p.shopId}-${p.itemId}`,
-          title: p.name,
-          price,
-          originalPrice,
-          discount,
-          image: p.image,
-          shop: p.shopName,
+          title: p.name, price, originalPrice, discount,
+          image: p.image, shop: p.shopName,
           commissionRate: p.commissionRate || 0,
           sellerComm: p.sellerCommissionRate || 0,
-          link: p.url,
-          affiliateLink: p.affiliateUrl || p.url,
-          isFlash: true,
+          link: p.url, affiliateLink: p.affiliateUrl || p.url, isFlash: true,
         };
       });
-
     res.json({ products, total: products.length });
   } catch(err) {
     console.error('[/shopee/flash]', err.message);
@@ -208,29 +135,22 @@ app.post('/shopee/flash', async (req, res) => {
   }
 });
 
-// ── ROTA: Converter link ──────────────────────────────────────────
 app.post('/shopee/convert', async (req, res) => {
   const { url, subId = '', appId, secret } = req.body;
   if (!url) return res.status(400).json({ error: 'URL obrigatória' });
-
   if (appId && secret) {
     try {
       const query = `
         mutation generateAffiliateLink($input: GenerateAffiliateLinkInput!) {
-          generateAffiliateLink(input: $input) {
-            affiliate_link
-          }
+          generateAffiliateLink(input: $input) { affiliate_link }
         }
       `;
       const variables = { input: { original_url: url, sub_ids: subId ? [subId] : [] } };
       const data = await shopeeQuery(appId, secret, query, variables);
       const affiliateLink = data?.generateAffiliateLink?.affiliate_link;
       if (affiliateLink) return res.json({ affiliateLink, original: url, method: 'api' });
-    } catch(e) {
-      console.warn('[Shopee API convert]', e.message);
-    }
+    } catch(e) { console.warn('[convert]', e.message); }
   }
-
   try {
     const u = new URL(url);
     if (subId) u.searchParams.set('af_sub_siteid', subId);
@@ -241,11 +161,9 @@ app.post('/shopee/convert', async (req, res) => {
   }
 });
 
-// ── ROTA: Diagnóstico de credenciais ─────────────────────────────
 app.post('/shopee/ping', async (req, res) => {
   const { appId, secret } = req.body;
   if (!appId || !secret) return res.status(400).json({ error: 'appId e secret são obrigatórios' });
-
   try {
     const query = `query { getOfferList(input: { page: 1, limit: 1 }) { nodes { itemId name } } }`;
     const data = await shopeeQuery(appId, secret, query, {});
@@ -256,5 +174,5 @@ app.post('/shopee/ping', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`ShopeePro Backend v3.1 rodando na porta ${PORT}`);
+  console.log(`ShopeePro Backend v3.2 rodando na porta ${PORT}`);
 });
