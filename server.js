@@ -82,6 +82,7 @@ app.post('/shopee/search', async (req, res) => {
   const {
     appId, secret,
     keyword = '',
+    shopId = '',
     minComm = 0,
     maxPrice = 0,
     minPrice = 0,
@@ -95,11 +96,12 @@ app.post('/shopee/search', async (req, res) => {
 
   try {
     const kw  = keyword  ? `, keyword: "${keyword.replace(/"/g, '')}"` : '';
+    const sid = shopId   ? `, shopId: "${String(shopId).replace(/"/g, '')}"` : '';
     const si  = subId    ? `, subId: "${subId}"`                        : '';
     const pg  = `, page: ${parseInt(page) || 1}`;
     const lim = `, limit: ${Math.min(parseInt(limit) || 30, 50)}`;
 
-    const query = `query { productOfferV2(sortType:5${kw}${si}${pg}${lim}) {
+    const query = `query { productOfferV2(sortType:5${kw}${sid}${si}${pg}${lim}) {
       nodes { itemId shopId productName imageUrl priceMin priceMax commissionRate
               sellerCommissionRate sales ratingStar priceDiscountRate shopName productLink offerLink }
       pageInfo { hasNextPage page }
